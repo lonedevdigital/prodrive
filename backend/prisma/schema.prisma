@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum FolderSharePermission {
+  VIEW
+  EDIT
+}
+
+model User {
+  id           String     @id @default(cuid()) @db.VarChar(191)
+  name         String     @db.VarChar(255)
+  email        String     @unique @db.VarChar(191)
+  passwordHash String     @db.VarChar(255)
+  role         UserRole   @default(USER)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  folders      Folder[]
+  files        FileObject[]
+}
+
+model Folder {
+  id               String                @id @default(cuid()) @db.VarChar(191)
+  name             String                @db.VarChar(255)
+  ownerId          String                @db.VarChar(191)
+  parentId         String?               @db.VarChar(191)
+  isPublic         Boolean               @default(false)
+  publicToken      String?               @unique @db.VarChar(191)
+  publicPermission FolderSharePermission @default(VIEW)
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+  owner            User                  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  parent           Folder?               @relation("FolderChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children         Folder[]              @relation("FolderChildren")
+  files            FileObject[]
+
+  @@index([ownerId, parentId])
+  @@index([publicToken])
+}
+
+model FileObject {
+  id          String    @id @default(cuid()) @db.VarChar(191)
+  name        String    @db.VarChar(255)
+  key         String    @unique @db.VarChar(512)
+  size        Int
+  mimeType    String?   @db.VarChar(255)
+  ownerId     String    @db.VarChar(191)
+  folderId    String?   @db.VarChar(191)
+  isPublic    Boolean   @default(false)
+  publicToken String?   @unique @db.VarChar(191)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  owner       User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  folder      Folder?   @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  @@index([ownerId, folderId])
+  @@index([publicToken])
+}
