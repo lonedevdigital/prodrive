@@ -177,6 +177,50 @@ const authRoutes: FastifyPluginAsync = async (fastify) => {
       return { user };
     }
   );
+
+  fastify.patch(
+    "/profile",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const parsed = z
+        .object({ name: z.string().min(2).max(100) })
+        .safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ message: "Invalid payload" });
+      }
+      const updated = await prisma.user.update({
+        where: { id: request.user.userId },
+        data: { name: parsed.data.name },
+        select: { id: true, name: true, email: true, role: true }
+      });
+      return { user: updated };
+    }
+  );
+
+  fastify.post(
+    "/change-password",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const parsed = z
+        .object({
+          oldPassword: z.string().min(1),
+          newPassword: z.string().min(6)
+        })
+        .safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ message: "Invalid payload" });
+      }
+      const user = await prisma.user.findUnique({
+        where: { id: request.user.userId }
+      });
+      if (!user) return reply.code(404).send({ message: "User not found" });
+      const valid = await bcrypt.compare(parsed.data.oldPassword, user.passwordHash);
+      if (!valid) return reply.code(401).send({ message: "Password lama salah" });
+      const passwordHash = await bcrypt.hash(parsed.data.newPassword, 10);
+      await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+      return { message: "Password berhasil diubah" };
+    }
+  );
 };
 
 export default authRoutes;
