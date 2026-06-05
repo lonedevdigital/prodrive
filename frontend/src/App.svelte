@@ -100,6 +100,9 @@
   let menu: MenuState = { open: false, x: 0, y: 0, target: null };
   let uploadFileInput: HTMLInputElement | null = null;
   let uploadFolderInput: HTMLInputElement | null = null;
+  let viewMode: "list" | "grid" = "list";
+  let thumbnailCache = new Map<string, string>();
+  let loadingThumbnails = false;
 
   // Profile modal
   let showProfile = false;
@@ -121,6 +124,7 @@
   $: latestUploadBatch = uploadBatches.length ? uploadBatches[uploadBatches.length - 1] : null;
   $: isAtRoot = currentFolderId === null;
   $: selectedCount = selectedIds.size;
+  $: selectedFileCount = filteredRows.filter((row) => selectedIds.has(rowId(row)) && row.kind === "file").length;
 
   $: driveRows = [...folders.map(folderToRow), ...files.map(fileToRow)].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
@@ -448,7 +452,7 @@
 
   function openBackgroundMenu(event: MouseEvent) {
     const target = event.target as HTMLElement;
-    if (target.closest("tr[data-row='1']")) return;
+    if (target.closest("[data-row='1']")) return;
     openMenu(event, null);
   }
 
@@ -763,6 +767,7 @@
     currentFolderId = folder.id;
     selectedRow = null;
     selectedIds = new Set();
+    thumbnailCache = new Map();
     void refreshDrive();
   }
 
@@ -771,6 +776,7 @@
     currentFolderId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
     selectedRow = null;
     selectedIds = new Set();
+    thumbnailCache = new Map();
     void refreshDrive();
   }
 
@@ -879,6 +885,101 @@
     closeMenu();
     try { await action(); }
     catch (error) { setError(error instanceof Error ? error.message : "Aksi gagal dijalankan"); }
+  }
+
+  function getFileColorClass(mimeType?: string | null): string {
+    if (!mimeType) return "text-[#5f6368]";
+    if (mimeType.startsWith("image/")) return "text-[#34a853]";
+    if (mimeType.startsWith("video/")) return "text-[#9c27b0]";
+    if (mimeType.startsWith("audio/")) return "text-[#ff9800]";
+    if (mimeType === "application/pdf") return "text-[#ea4335]";
+    if (mimeType.startsWith("text/") || mimeType.includes("javascript") || mimeType.includes("json")) return "text-[#1a73e8]";
+    if (mimeType.includes("zip") || mimeType.includes("rar") || mimeType.includes("tar") || mimeType.includes("7z")) return "text-[#795548]";
+    return "text-[#5f6368]";
+  }
+
+  function getFileBgClass(mimeType?: string | null): string {
+    if (!mimeType) return "bg-[#f8fafd]";
+    if (mimeType.startsWith("image/")) return "bg-[#e6f4ea]";
+    if (mimeType.startsWith("video/")) return "bg-[#f3e5f5]";
+    if (mimeType.startsWith("audio/")) return "bg-[#fff8e1]";
+    if (mimeType === "application/pdf") return "bg-[#fce8e6]";
+    if (mimeType.startsWith("text/") || mimeType.includes("javascript") || mimeType.includes("json")) return "bg-[#e8f0fe]";
+    if (mimeType.includes("zip") || mimeType.includes("rar") || mimeType.includes("tar")) return "bg-[#efebe9]";
+    return "bg-[#f8fafd]";
+  }
+
+  async function downloadFile(file: FileItem) {
+    try {
+      let url: string;
+      if (publicMode && publicShareToken) {
+        url = file.downloadUrl ?? `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/download`;
+      } else if (file.isPublic && file.publicUrl) {
+        url = file.publicUrl;
+      } else {
+        const resp = await request<{ url: string }>(`/api/files/${file.id}/download-url`);
+        url = resp.url;
+      }
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download gagal");
+    }
+  }
+
+  async function downloadSelected() {
+    const fileRows = filteredRows.filter(
+      (row) => selectedIds.has(rowId(row)) && row.kind === "file"
+    ) as Array<{ kind: "file"; file: FileItem; id: string; name: string; modifiedAt: string; sizeLabel: string }>;
+    if (!fileRows.length) {
+      setError("Tidak ada file yang dipilih (folder tidak dapat didownload).");
+      return;
+    }
+    for (const row of fileRows) {
+      await downloadFile(row.file);
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    setSuccess(`${fileRows.length} file berhasil didownload.`);
+  }
+
+  async function loadGridThumbnails() {
+    if (viewMode !== "grid" || loadingThumbnails) return;
+    loadingThumbnails = true;
+    try {
+      const imageFiles = filteredRows
+        .filter((r) => r.kind === "file" && (r as { kind: "file"; file: FileItem }).file.mimeType?.startsWith("image/"))
+        .map((r) => (r as { kind: "file"; file: FileItem }).file)
+        .filter((f) => !thumbnailCache.has(f.id))
+        .slice(0, 20);
+
+      for (const file of imageFiles) {
+        try {
+          let url: string;
+          if (publicMode && publicShareToken) {
+            url = file.downloadUrl ?? `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/download`;
+          } else if (file.isPublic && file.publicUrl) {
+            url = file.publicUrl;
+          } else {
+            const resp = await request<{ url: string }>(`/api/files/${file.id}/download-url`);
+            url = resp.url;
+          }
+          thumbnailCache.set(file.id, url);
+          thumbnailCache = thumbnailCache;
+        } catch { /* skip failed thumbnails */ }
+      }
+    } finally {
+      loadingThumbnails = false;
+    }
+  }
+
+  $: if (viewMode === "grid" && filteredRows.length > 0) {
+    void loadGridThumbnails();
   }
 
   function formatSize(bytes: number): string {
@@ -1031,11 +1132,30 @@
                 <button class={`mr-2 rounded-full px-3 py-1 ${index === breadcrumbs.length - 1 ? "bg-[#e8f0fe] text-[#1967d2]" : "hover:bg-[#f1f3f4]"}`} on:click={() => goToBreadcrumb(index)}>{crumb.name}</button>
               {/each}
             </div>
-            {#if !publicMode}
-              <p class="text-xs text-[#5f6368]">
-                Storage: {storageSummary ? `${storageSummary.totalGb.toFixed(3)} GB` : "-"}
-              </p>
-            {/if}
+            <div class="flex items-center gap-3">
+              {#if !publicMode}
+                <p class="text-xs text-[#5f6368]">
+                  Storage: {storageSummary ? `${storageSummary.totalGb.toFixed(3)} GB` : "-"}
+                </p>
+              {/if}
+              <!-- View mode toggle -->
+              <div class="flex overflow-hidden rounded-lg border border-[#dadce0]">
+                <button
+                  class="px-2.5 py-1.5 transition-colors {viewMode === 'list' ? 'bg-[#e8f0fe] text-[#1967d2]' : 'text-[#5f6368] hover:bg-[#f1f3f4]'}"
+                  title="Tampilan list"
+                  on:click={() => (viewMode = 'list')}
+                >
+                  <Icon name="list" size={14} />
+                </button>
+                <button
+                  class="border-l border-[#dadce0] px-2.5 py-1.5 transition-colors {viewMode === 'grid' ? 'bg-[#e8f0fe] text-[#1967d2]' : 'text-[#5f6368] hover:bg-[#f1f3f4]'}"
+                  title="Tampilan grid"
+                  on:click={() => { viewMode = 'grid'; void loadGridThumbnails(); }}
+                >
+                  <Icon name="grid" size={14} />
+                </button>
+              </div>
+            </div>
           </div>
 
           <!-- Messages -->
@@ -1093,10 +1213,19 @@
             </div>
           {/if}
 
-          <!-- Bulk action bar (shown when 2+ items selected) -->
-          {#if selectedCount > 1}
-            <div class="mx-4 mt-3 flex items-center gap-3 rounded-xl border border-[#d2e3fc] bg-[#e8f0fe] px-4 py-2">
+          <!-- Bulk action bar (shown when 1+ items selected) -->
+          {#if selectedCount >= 1}
+            <div class="mx-4 mt-3 flex items-center gap-2 rounded-xl border border-[#d2e3fc] bg-[#e8f0fe] px-4 py-2">
               <span class="text-sm font-medium text-[#1967d2]">{selectedCount} item dipilih</span>
+              {#if selectedFileCount > 0}
+                <button
+                  class="flex items-center gap-1.5 rounded-full bg-[#1a73e8] px-3 py-1 text-xs font-medium text-white hover:bg-[#1557b0] transition-colors"
+                  on:click={downloadSelected}
+                >
+                  <Icon name="download" size={12} />
+                  Download{selectedFileCount > 1 ? ` (${selectedFileCount})` : ""}
+                </button>
+              {/if}
               {#if canEditCurrentView}
                 <button
                   class="rounded-full bg-[#ea4335] px-3 py-1 text-xs font-medium text-white hover:bg-[#c62828] transition-colors"
@@ -1114,69 +1243,157 @@
             </div>
           {/if}
 
-          <!-- File table -->
+          <!-- File display: List or Grid -->
           <div class="mt-2 flex-1 overflow-auto pb-14 md:pb-0" role="presentation" on:contextmenu={openBackgroundMenu}>
-            <table class="w-full min-w-215 text-sm">
-              <thead class="sticky top-0 bg-white text-left text-xs uppercase text-[#5f6368]">
-                <tr>
-                  <th class="border-b border-[#e8eaed] px-3 py-3 w-10">
-                    <input
-                      type="checkbox"
-                      class="cursor-pointer accent-[#1a73e8]"
-                      checked={filteredRows.length > 0 && selectedCount === filteredRows.length}
-                      on:click={() => selectedCount === filteredRows.length ? clearSelection() : selectAll()}
-                    />
-                  </th>
-                  <th class="border-b border-[#e8eaed] px-4 py-3">Name</th>
-                  <th class="border-b border-[#e8eaed] px-4 py-3">Owner</th>
-                  <th class="border-b border-[#e8eaed] px-4 py-3">Last modified</th>
-                  <th class="border-b border-[#e8eaed] px-4 py-3">File size</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#if loadingDrive}
-                  <tr><td class="px-4 py-6 text-[#5f6368]" colspan="5">Memuat data...</td></tr>
-                {:else if filteredRows.length === 0}
-                  <tr><td class="px-4 py-6 text-[#5f6368]" colspan="5">Tidak ada data.</td></tr>
-                {:else}
+            {#if viewMode === "list"}
+              <!-- List view -->
+              <table class="w-full min-w-215 text-sm">
+                <thead class="sticky top-0 bg-white text-left text-xs uppercase text-[#5f6368]">
+                  <tr>
+                    <th class="border-b border-[#e8eaed] px-3 py-3 w-10">
+                      <input
+                        type="checkbox"
+                        class="cursor-pointer accent-[#1a73e8]"
+                        checked={filteredRows.length > 0 && selectedCount === filteredRows.length}
+                        on:click={() => selectedCount === filteredRows.length ? clearSelection() : selectAll()}
+                      />
+                    </th>
+                    <th class="border-b border-[#e8eaed] px-4 py-3">Name</th>
+                    <th class="border-b border-[#e8eaed] px-4 py-3">Owner</th>
+                    <th class="border-b border-[#e8eaed] px-4 py-3">Last modified</th>
+                    <th class="border-b border-[#e8eaed] px-4 py-3">File size</th>
+                    <th class="border-b border-[#e8eaed] px-3 py-3 w-12"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#if loadingDrive}
+                    <tr><td class="px-4 py-6 text-[#5f6368]" colspan="6">Memuat data...</td></tr>
+                  {:else if filteredRows.length === 0}
+                    <tr><td class="px-4 py-6 text-[#5f6368]" colspan="6">Tidak ada data.</td></tr>
+                  {:else}
+                    {#each filteredRows as row, index}
+                      <tr
+                        data-row="1"
+                        class={`group cursor-default border-b border-[#f1f3f4] hover:bg-[#f8f9fa] ${isRowSelected(row) ? "bg-[#e8f0fe] hover:bg-[#dce8fd]" : ""}`}
+                        on:click={(e) => handleRowClick(e, row, index)}
+                        on:dblclick={() => (row.kind === "folder" ? openFolder(row.folder) : openFile(row.file))}
+                        on:contextmenu={(event) => openMenu(event, row)}
+                      >
+                        <td class="px-3 py-3">
+                          <input
+                            type="checkbox"
+                            class="cursor-pointer accent-[#1a73e8]"
+                            checked={isRowSelected(row)}
+                            on:click|stopPropagation={() => toggleCheckbox(row, index)}
+                          />
+                        </td>
+                        <td class="px-4 py-3">
+                          <div class="flex items-center gap-2">
+                            <span class={row.kind === "folder" ? "text-[#f9ab00]" : "text-[#5f6368]"}>
+                              <Icon name={row.kind === "folder" ? "folder" : "file"} size={14} />
+                            </span>
+                            <span>{row.name}</span>
+                            {#if row.kind === "folder" && row.folder.isPublic}
+                              <span class="rounded-full bg-[#e6f4ea] px-1.5 py-0.5 text-[10px] text-[#137333]">shared</span>
+                            {/if}
+                            {#if row.kind === "file" && row.file.isPublic}
+                              <span class="rounded-full bg-[#e6f4ea] px-1.5 py-0.5 text-[10px] text-[#137333]">public</span>
+                            {/if}
+                          </div>
+                        </td>
+                        <td class="px-4 py-3 text-[#5f6368]">{publicMode ? "Public" : (user?.name ?? "-")}</td>
+                        <td class="px-4 py-3 text-[#5f6368]">{formatDate(row.modifiedAt)}</td>
+                        <td class="px-4 py-3 text-[#5f6368]">{row.sizeLabel}</td>
+                        <td class="px-3 py-3">
+                          {#if row.kind === "file"}
+                            <button
+                              class="rounded-full p-1.5 text-[#5f6368] opacity-0 transition-all hover:bg-[#e8f0fe] hover:text-[#1a73e8] group-hover:opacity-100"
+                              title="Download {row.name}"
+                              on:click|stopPropagation={() => downloadFile(row.file)}
+                            >
+                              <Icon name="download" size={14} />
+                            </button>
+                          {/if}
+                        </td>
+                      </tr>
+                    {/each}
+                  {/if}
+                </tbody>
+              </table>
+            {:else}
+              <!-- Grid view -->
+              {#if loadingDrive}
+                <div class="px-4 py-8 text-sm text-[#5f6368]">Memuat data...</div>
+              {:else if filteredRows.length === 0}
+                <div class="px-4 py-8 text-sm text-[#5f6368]">Tidak ada data.</div>
+              {:else}
+                <div class="p-4 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                   {#each filteredRows as row, index}
-                    <tr
+                    <div
                       data-row="1"
-                      class={`cursor-default border-b border-[#f1f3f4] hover:bg-[#f8f9fa] ${isRowSelected(row) ? "bg-[#e8f0fe] hover:bg-[#dce8fd]" : ""}`}
+                      role="button"
+                      tabindex="0"
+                      class="group relative cursor-default overflow-hidden rounded-xl border transition-all hover:shadow-md {isRowSelected(row) ? 'border-[#1a73e8] bg-[#e8f0fe]' : 'border-[#e8eaed] bg-white'}"
                       on:click={(e) => handleRowClick(e, row, index)}
-                      on:dblclick={() => (row.kind === "folder" ? openFolder(row.folder) : openFile(row.file))}
-                      on:contextmenu={(event) => openMenu(event, row)}
+                      on:dblclick={() => row.kind === "folder" ? openFolder(row.folder) : openFile(row.file)}
+                      on:contextmenu={(e) => openMenu(e, row)}
+                      on:keydown={(e) => e.key === "Enter" && (row.kind === "folder" ? openFolder(row.folder) : openFile(row.file))}
                     >
-                      <td class="px-3 py-3">
+                      <!-- Checkbox overlay -->
+                      <div class="absolute left-2 top-2 z-10 transition-opacity {isRowSelected(row) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}">
                         <input
                           type="checkbox"
-                          class="cursor-pointer accent-[#1a73e8]"
+                          class="h-4 w-4 cursor-pointer accent-[#1a73e8]"
                           checked={isRowSelected(row)}
                           on:click|stopPropagation={() => toggleCheckbox(row, index)}
                         />
-                      </td>
-                      <td class="px-4 py-3">
-                        <div class="flex items-center gap-2">
-                          <span class={row.kind === "folder" ? "text-[#f9ab00]" : "text-[#5f6368]"}>
-                            <Icon name={row.kind === "folder" ? "folder" : "file"} size={14} />
+                      </div>
+
+                      <!-- Preview area -->
+                      <div class="flex h-32 items-center justify-center overflow-hidden {row.kind === 'folder' ? 'bg-[#fffde7]' : getFileBgClass(row.kind === 'file' ? row.file.mimeType : null)}">
+                        {#if row.kind === "folder"}
+                          <span class="text-[#f9ab00]"><Icon name="folder" size={52} /></span>
+                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/") && thumbnailCache.has(row.file.id)}
+                          <img
+                            src={thumbnailCache.get(row.file.id)}
+                            alt={row.name}
+                            class="h-full w-full object-cover"
+                            loading="lazy"
+                          />
+                        {:else}
+                          <span class={getFileColorClass(row.kind === "file" ? row.file.mimeType : null)}>
+                            <Icon name="file" size={42} />
                           </span>
-                          <span>{row.name}</span>
-                          {#if row.kind === "folder" && row.folder.isPublic}
-                            <span class="rounded-full bg-[#e6f4ea] px-1.5 py-0.5 text-[10px] text-[#137333]">shared</span>
-                          {/if}
-                          {#if row.kind === "file" && row.file.isPublic}
-                            <span class="rounded-full bg-[#e6f4ea] px-1.5 py-0.5 text-[10px] text-[#137333]">public</span>
+                        {/if}
+                      </div>
+
+                      <!-- Card footer -->
+                      <div class="border-t border-[#f1f3f4] px-2.5 py-2">
+                        <p class="truncate text-xs font-medium leading-snug text-[#202124]" title={row.name}>{row.name}</p>
+                        <div class="mt-1 flex items-center justify-between">
+                          <p class="text-[11px] text-[#5f6368]">
+                            {#if row.kind === "folder"}
+                              Folder
+                            {:else}
+                              {row.sizeLabel}
+                            {/if}
+                          </p>
+                          {#if row.kind === "file"}
+                            <button
+                              class="rounded-full p-1 text-[#1a73e8] opacity-0 transition-all hover:bg-[#d2e3fc] group-hover:opacity-100"
+                              title="Download {row.name}"
+                              on:click|stopPropagation={() => downloadFile(row.file)}
+                            >
+                              <Icon name="download" size={12} />
+                            </button>
                           {/if}
                         </div>
-                      </td>
-                      <td class="px-4 py-3 text-[#5f6368]">{publicMode ? "Public" : (user?.name ?? "-")}</td>
-                      <td class="px-4 py-3 text-[#5f6368]">{formatDate(row.modifiedAt)}</td>
-                      <td class="px-4 py-3 text-[#5f6368]">{row.sizeLabel}</td>
-                    </tr>
+                      </div>
+                    </div>
                   {/each}
-                {/if}
-              </tbody>
-            </table>
+                </div>
+              {/if}
+            {/if}
           </div>
         </section>
       </main>
