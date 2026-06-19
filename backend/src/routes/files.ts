@@ -12,11 +12,7 @@ import {
   sanitizeFilename,
   toFileResponse
 } from "../lib/file-utils";
-import {
-  deleteThumbnailsQuietly,
-  isThumbnailableImage,
-  thumbnailSignedUrl
-} from "../lib/thumbnail";
+import { generatePreviewBuffer, isThumbnailableImage } from "../lib/thumbnail";
 import { streamZip } from "../lib/zip";
 
 const DEFAULT_PAGE_SIZE = 30;
@@ -133,9 +129,10 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
     }
   );
 
-  // Lightweight, cached webp thumbnail for grid previews (never full-res).
+  // Downscaled preview for grid display. Generated on the fly in the file's
+  // ORIGINAL format and never stored — the original object is untouched.
   fastify.get(
-    "/:id/thumbnail-url",
+    "/:id/thumbnail",
     { preHandler: [fastify.authenticate] },
     async (request, reply) => {
       const params = request.params as { id: string };
@@ -151,11 +148,13 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       try {
-        const url = await thumbnailSignedUrl(file);
-        return { url, expiresInSeconds: 900 };
+        const buffer = await generatePreviewBuffer(file);
+        reply.header("Content-Type", file.mimeType || "application/octet-stream");
+        reply.header("Cache-Control", "private, max-age=86400");
+        return reply.send(buffer);
       } catch (error) {
         request.log.error({ err: error, fileId: file.id }, "thumbnail failed");
-        return reply.code(500).send({ message: "Gagal membuat thumbnail" });
+        return reply.code(500).send({ message: "Gagal membuat preview" });
       }
     }
   );
@@ -512,7 +511,6 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
 
       await deleteObject(file.key);
       await prisma.fileObject.delete({ where: { id: file.id } });
-      await deleteThumbnailsQuietly([file.id]);
 
       return { message: "File deleted" };
     }

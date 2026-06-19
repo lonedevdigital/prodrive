@@ -16,7 +16,7 @@ import {
   sanitizeFilename
 } from "../lib/file-utils";
 import {
-  getThumbnailBuffer,
+  generatePreviewBuffer,
   isThumbnailableImage
 } from "../lib/thumbnail";
 import { buildArchivePath, streamZip } from "../lib/zip";
@@ -271,13 +271,16 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       try {
-        const buffer = await getThumbnailBuffer(file);
-        reply.header("Content-Type", "image/webp");
+        const buffer = await generatePreviewBuffer(file);
+        reply.header(
+          "Content-Type",
+          file.mimeType || "application/octet-stream"
+        );
         reply.header("Cache-Control", "public, max-age=86400");
         return reply.send(buffer);
       } catch (error) {
         request.log.error({ err: error, fileId: file.id }, "public thumbnail failed");
-        return reply.code(500).send({ message: "Gagal membuat thumbnail" });
+        return reply.code(500).send({ message: "Gagal membuat preview" });
       }
     }
   );

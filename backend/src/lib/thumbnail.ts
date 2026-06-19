@@ -1,27 +1,15 @@
 import sharp from "sharp";
-import {
-  deleteObjectQuietly,
-  getObject,
-  headObject,
-  signedDownloadUrl,
-  uploadObject
-} from "./r2";
+import { getObject } from "./r2";
 
-const THUMB_PREFIX = "thumb";
-// Thumbnails are served in the grid preview at ~160-220px wide; 480px keeps
-// them crisp on retina screens while staying tiny compared to the original.
-const THUMB_WIDTH = 480;
-const THUMB_QUALITY = 72;
+// Preview width for the grid. Images are downscaled only for display; the
+// original file in storage is never modified, converted, or copied.
+const PREVIEW_WIDTH = 480;
 
-export function thumbnailKeyForFile(fileId: string): string {
-  return `${THUMB_PREFIX}/${fileId}.webp`;
-}
-
-/** Images we can rasterise into a webp thumbnail with sharp. */
+/** Images we can downscale with sharp for a preview. */
 export function isThumbnailableImage(mimeType?: string | null): boolean {
   if (!mimeType) return false;
   if (!mimeType.startsWith("image/")) return false;
-  // sharp needs librsvg for SVG; treat vectors as non-thumbnailable.
+  // sharp needs librsvg for SVG; treat vectors as non-previewable.
   if (mimeType === "image/svg+xml") return false;
   return true;
 }
@@ -33,69 +21,23 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
   return Buffer.from(bytes);
 }
 
-async function generateThumbnail(
-  sourceKey: string,
-  thumbKey: string
-): Promise<void> {
-  const object = await getObject(sourceKey);
+/**
+ * Generates a downscaled preview of an image ON THE FLY, keeping the original
+ * file's format (jpeg stays jpeg, png stays png, ...). Nothing is written back
+ * to storage — this is purely a smaller copy for the grid preview, streamed
+ * with cache headers so the browser keeps it.
+ */
+export async function generatePreviewBuffer(file: {
+  key: string;
+}): Promise<Buffer> {
+  const object = await getObject(file.key);
   if (!object.Body) {
     throw new Error("Source object has no body");
   }
   const input = await bodyToBuffer(object.Body);
-  const output = await sharp(input, { failOn: "none" })
+  // No explicit output format → sharp re-encodes in the SAME format as input.
+  return sharp(input, { failOn: "none" })
     .rotate() // respect EXIF orientation
-    .resize({ width: THUMB_WIDTH, withoutEnlargement: true })
-    .webp({ quality: THUMB_QUALITY })
+    .resize({ width: PREVIEW_WIDTH, withoutEnlargement: true })
     .toBuffer();
-
-  await uploadObject({
-    key: thumbKey,
-    body: output,
-    contentType: "image/webp"
-  });
-}
-
-/**
- * Ensures a cached webp thumbnail exists in R2 and returns its key.
- * Generates it on the first request, then reuses the cached object.
- */
-export async function ensureThumbnailKey(file: {
-  id: string;
-  key: string;
-}): Promise<string> {
-  const thumbKey = thumbnailKeyForFile(file.id);
-  const exists = await headObject(thumbKey);
-  if (!exists) {
-    await generateThumbnail(file.key, thumbKey);
-  }
-  return thumbKey;
-}
-
-/** Signed URL to the cached thumbnail (used by the authenticated app). */
-export async function thumbnailSignedUrl(file: {
-  id: string;
-  key: string;
-}): Promise<string> {
-  const thumbKey = await ensureThumbnailKey(file);
-  return signedDownloadUrl(thumbKey);
-}
-
-/** Raw webp bytes of the cached thumbnail (used by public share streaming). */
-export async function getThumbnailBuffer(file: {
-  id: string;
-  key: string;
-}): Promise<Buffer> {
-  const thumbKey = await ensureThumbnailKey(file);
-  const object = await getObject(thumbKey);
-  if (!object.Body) {
-    throw new Error("Thumbnail object has no body");
-  }
-  return bodyToBuffer(object.Body);
-}
-
-/** Best-effort cleanup of cached thumbnails when their files are removed. */
-export async function deleteThumbnailsQuietly(fileIds: string[]): Promise<void> {
-  await Promise.all(
-    fileIds.map((id) => deleteObjectQuietly(thumbnailKeyForFile(id)))
-  );
 }

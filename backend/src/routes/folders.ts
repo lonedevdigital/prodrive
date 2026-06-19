@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { deleteObjectsStrict } from "../lib/r2";
 import { prisma } from "../lib/prisma";
-import { deleteThumbnailsQuietly } from "../lib/thumbnail";
 import { buildArchivePath, streamZip } from "../lib/zip";
 
 const createFolderSchema = z.object({
@@ -404,8 +403,6 @@ const folderRoutes: FastifyPluginAsync = async (fastify) => {
           where: { id: folder.id }
         });
       });
-
-      await deleteThumbnailsQuietly(files.map((file) => file.id));
 
       return {
         message: "Folder deleted",

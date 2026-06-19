@@ -103,8 +103,8 @@
   let uploadFileInput: HTMLInputElement | null = null;
   let uploadFolderInput: HTMLInputElement | null = null;
   let viewMode: "list" | "grid" = "list";
-  let thumbnailCache = new Map<string, string>();
-  const thumbnailLoading = new Set<string>();
+  // Track image ids whose preview failed to load so we can show a fallback icon.
+  let thumbFailed = new Set<string>();
 
   // ── Pagination (infinite scroll, +30 each time) ───────────────────────────
   const PAGE_SIZE = 30;
@@ -840,7 +840,7 @@
     currentFolderId = folder.id;
     selectedRow = null;
     selectedIds = new Set();
-    thumbnailCache = new Map();
+    thumbFailed = new Set();
     void refreshDrive();
   }
 
@@ -849,7 +849,7 @@
     currentFolderId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
     selectedRow = null;
     selectedIds = new Set();
-    thumbnailCache = new Map();
+    thumbFailed = new Set();
     void refreshDrive();
   }
 
@@ -1059,56 +1059,23 @@
     setSuccess(`Menyiapkan ZIP berisi ${fileRows.length} file...`);
   }
 
-  // ── Lazy thumbnails ────────────────────────────────────────────────────────
-  // Fetch a small, server-optimised webp thumbnail (never the full-res image),
-  // only when the card scrolls near the viewport.
-  async function requestThumbnail(file: FileItem) {
-    if (thumbnailCache.has(file.id) || thumbnailLoading.has(file.id)) return;
-    if (!file.mimeType?.startsWith("image/")) return;
-    thumbnailLoading.add(file.id);
-    try {
-      let url: string;
-      if (publicMode && publicShareToken) {
-        url =
-          file.thumbnailUrl ??
-          `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/thumbnail`;
-      } else {
-        const resp = await request<{ url: string }>(`/api/files/${file.id}/thumbnail-url`);
-        url = resp.url;
-      }
-      thumbnailCache.set(file.id, url);
-      thumbnailCache = thumbnailCache; // trigger reactivity
-    } catch {
-      /* leave the fallback icon in place */
-    } finally {
-      thumbnailLoading.delete(file.id);
+  // ── Preview thumbnails ──────────────────────────────────────────────────────
+  // URL of a downscaled preview served in the file's ORIGINAL format (the
+  // backend resizes on the fly and never stores or converts the original).
+  // The native loading="lazy" on the <img> defers the request until the card
+  // is near the viewport, keeping scroll light.
+  function thumbUrl(file: FileItem): string {
+    if (publicMode && publicShareToken) {
+      return (
+        file.thumbnailUrl ??
+        `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/thumbnail`
+      );
     }
+    return `${API_BASE}/api/files/${file.id}/thumbnail`;
   }
 
-  // Svelte action: lazy-load a thumbnail when the element nears the viewport.
-  function lazyThumb(node: HTMLElement, file: FileItem) {
-    let observer: IntersectionObserver | null = null;
-    if (file.mimeType?.startsWith("image/")) {
-      observer = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            if (entry.isIntersecting) {
-              void requestThumbnail(file);
-              observer?.disconnect();
-              observer = null;
-              break;
-            }
-          }
-        },
-        { rootMargin: "300px" }
-      );
-      observer.observe(node);
-    }
-    return {
-      destroy() {
-        observer?.disconnect();
-      }
-    };
+  function markThumbFailed(id: string) {
+    thumbFailed = new Set(thumbFailed).add(id);
   }
 
   function formatSize(bytes: number): string {
@@ -1505,22 +1472,15 @@
                       <div class="flex h-32 items-center justify-center overflow-hidden {row.kind === 'folder' ? 'bg-[#fffde7]' : getFileBgClass(row.kind === 'file' ? row.file.mimeType : null)}">
                         {#if row.kind === "folder"}
                           <span class="text-[#f9ab00]"><Icon name="folder" size={52} /></span>
-                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/")}
-                          <div class="h-full w-full" use:lazyThumb={row.file}>
-                            {#if thumbnailCache.has(row.file.id)}
-                              <img
-                                src={thumbnailCache.get(row.file.id)}
-                                alt={row.name}
-                                class="h-full w-full object-cover"
-                                loading="lazy"
-                                decoding="async"
-                              />
-                            {:else}
-                              <div class="flex h-full w-full animate-pulse items-center justify-center bg-[#eef1f5]">
-                                <span class="text-[#bdc1c6]"><Icon name="file" size={36} /></span>
-                              </div>
-                            {/if}
-                          </div>
+                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/") && !thumbFailed.has(row.file.id)}
+                          <img
+                            src={thumbUrl(row.file)}
+                            alt={row.name}
+                            class="h-full w-full object-cover"
+                            loading="lazy"
+                            decoding="async"
+                            on:error={() => markThumbFailed(row.file.id)}
+                          />
                         {:else}
                           <span class={getFileColorClass(row.kind === "file" ? row.file.mimeType : null)}>
                             <Icon name="file" size={42} />
