@@ -1074,6 +1074,16 @@
     return `${API_BASE}/api/files/${file.id}/thumbnail`;
   }
 
+  // Detect images by mime, falling back to the filename extension (e.g. HEIC,
+  // whose upload mime is often empty/octet-stream). SVG is excluded — the
+  // backend can't rasterise it, so it keeps the file icon.
+  const IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp|avif|bmp|tiff?|heic|heif)$/i;
+  function isImagePreviewable(file: FileItem): boolean {
+    if (file.mimeType === "image/svg+xml") return false;
+    if (file.mimeType?.startsWith("image/")) return true;
+    return IMAGE_EXT_RE.test(file.name);
+  }
+
   function markThumbFailed(id: string) {
     thumbFailed = new Set(thumbFailed).add(id);
   }
@@ -1472,7 +1482,7 @@
                       <div class="flex h-32 items-center justify-center overflow-hidden {row.kind === 'folder' ? 'bg-[#fffde7]' : getFileBgClass(row.kind === 'file' ? row.file.mimeType : null)}">
                         {#if row.kind === "folder"}
                           <span class="text-[#f9ab00]"><Icon name="folder" size={52} /></span>
-                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/") && !thumbFailed.has(row.file.id)}
+                        {:else if row.kind === "file" && isImagePreviewable(row.file) && !thumbFailed.has(row.file.id)}
                           <img
                             src={thumbUrl(row.file)}
                             alt={row.name}

@@ -143,13 +143,13 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
       if (!file) {
         return reply.code(404).send({ message: "File not found" });
       }
-      if (!isThumbnailableImage(file.mimeType)) {
+      if (!isThumbnailableImage(file.mimeType, file.name)) {
         return reply.code(400).send({ message: "File is not a previewable image" });
       }
 
       try {
-        const buffer = await generatePreviewBuffer(file);
-        reply.header("Content-Type", file.mimeType || "application/octet-stream");
+        const { buffer, contentType } = await generatePreviewBuffer(file);
+        reply.header("Content-Type", contentType);
         reply.header("Cache-Control", "private, max-age=86400");
         return reply.send(buffer);
       } catch (error) {
