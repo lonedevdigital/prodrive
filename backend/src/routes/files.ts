@@ -5,7 +5,7 @@ import { copyObject, deleteObject, signedDownloadUrl, uploadObject } from "../li
 import { prisma } from "../lib/prisma";
 import {
   UploadSizeLimitError,
-  uploadMultipartToR2
+  storeUploadedPart
 } from "../lib/upload-stream";
 import {
   generateStorageKey,
@@ -258,33 +258,28 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.code(404).send({ message: "Target folder not found" });
       }
 
-      const fileName = sanitizeFilename(part.filename || "file");
-      const key = generateStorageKey(request.user.userId, fileName);
-
-      let uploadedSize = 0;
+      let stored;
       try {
-        const result = await uploadMultipartToR2({
+        stored = await storeUploadedPart({
           part,
-          key,
-          contentType: part.mimetype
+          ownerId: request.user.userId
         });
-        uploadedSize = result.bytesUploaded;
       } catch (error) {
         if (error instanceof UploadSizeLimitError) {
           return reply.code(413).send({
             message: "Ukuran file melebihi limit upload server"
           });
         }
-        request.log.error({ err: error, key }, "R2 upload failed");
+        request.log.error({ err: error }, "upload failed");
         return reply.code(500).send({ message: "Upload ke storage gagal" });
       }
 
       const created = await prisma.fileObject.create({
         data: {
-          name: fileName,
-          key,
-          size: uploadedSize,
-          mimeType: part.mimetype,
+          name: stored.name,
+          key: stored.key,
+          size: stored.size,
+          mimeType: stored.mimeType,
           ownerId: request.user.userId,
           folderId
         }

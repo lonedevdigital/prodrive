@@ -52,7 +52,10 @@ function cacheSet(key: string, value: Preview): void {
 // De-dupe concurrent requests for the same not-yet-cached HEIC preview.
 const inFlight = new Map<string, Promise<Preview>>();
 
-function isHeic(file: { mimeType?: string | null; name?: string | null }): boolean {
+export function isHeicFile(file: {
+  mimeType?: string | null;
+  name?: string | null;
+}): boolean {
   const mime = (file.mimeType ?? "").toLowerCase();
   if (
     mime === "image/heic" ||
@@ -96,7 +99,7 @@ async function readObjectBuffer(key: string): Promise<Buffer> {
 async function buildHeicPreview(key: string): Promise<Preview> {
   const input = await readObjectBuffer(key);
   // Decode + downscale happens in a worker thread (off the event loop).
-  const buffer = await decodeHeicPreview(input);
+  const buffer = await decodeHeicPreview(input, PREVIEW_WIDTH);
   return { buffer, contentType: "image/jpeg" };
 }
 
@@ -116,7 +119,7 @@ export async function generatePreviewBuffer(file: {
   mimeType?: string | null;
   name?: string | null;
 }): Promise<Preview> {
-  if (isHeic(file)) {
+  if (isHeicFile(file)) {
     const cached = cacheGet(file.id);
     if (cached) return cached;
 

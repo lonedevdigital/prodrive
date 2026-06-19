@@ -9,7 +9,7 @@ import {
 import { prisma } from "../lib/prisma";
 import {
   UploadSizeLimitError,
-  uploadMultipartToR2
+  storeUploadedPart
 } from "../lib/upload-stream";
 import {
   generateStorageKey,
@@ -623,17 +623,12 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.code(403).send({ message: "Folder access denied" });
     }
 
-    const fileName = sanitizeFilename(part.filename || "file");
-    const key = generateStorageKey(shareContext.rootFolder.ownerId, fileName);
-
-    let uploadedSize = 0;
+    let stored;
     try {
-      const result = await uploadMultipartToR2({
+      stored = await storeUploadedPart({
         part,
-        key,
-        contentType: part.mimetype
+        ownerId: shareContext.rootFolder.ownerId
       });
-      uploadedSize = result.bytesUploaded;
     } catch (error) {
       if (error instanceof UploadSizeLimitError) {
         return reply.code(413).send({
@@ -645,10 +640,10 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
 
     const file = await prisma.fileObject.create({
       data: {
-        name: fileName,
-        key,
-        size: uploadedSize,
-        mimeType: part.mimetype,
+        name: stored.name,
+        key: stored.key,
+        size: stored.size,
+        mimeType: stored.mimeType,
         ownerId: shareContext.rootFolder.ownerId,
         folderId
       }

@@ -7,6 +7,14 @@ export function sanitizeFilename(filename: string): string {
   return filename.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+/** Rename a .heic/.heif file to .jpg (used when converting HEIC on upload). */
+export function swapHeicToJpg(filename: string): string {
+  if (/\.(heic|heif)$/i.test(filename)) {
+    return filename.replace(/\.(heic|heif)$/i, ".jpg");
+  }
+  return `${filename}.jpg`;
+}
+
 export function generateStorageKey(userId: string, filename: string): string {
   const clean = sanitizeFilename(filename || "file");
   return `${userId}/${randomUUID()}-${clean}`;

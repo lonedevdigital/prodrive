@@ -2,10 +2,10 @@ import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 
-// Pool of worker threads that decode HEIC previews. Keeping this small bounds
-// the transient CPU/RAM cost (each in-flight decode holds a full-resolution
-// bitmap), while still moving the blocking WASM work off the main thread and
-// allowing a couple of decodes to run in parallel.
+// Pool of worker threads that handle HEIC decoding (preview + upload→JPG).
+// Keeping this small bounds the transient CPU/RAM cost (each in-flight decode
+// holds a full-resolution bitmap), while moving the blocking WASM work off the
+// main thread and allowing a couple of jobs to run in parallel.
 const POOL_SIZE =
   Number(process.env.HEIC_DECODE_CONCURRENCY) ||
   Math.max(1, Math.min(2, (os.cpus().length || 2) - 1)) ||
@@ -14,11 +14,17 @@ const POOL_SIZE =
 // Plain .cjs sits next to this module in both src (dev/tsx) and dist (prod).
 const WORKER_FILE = path.join(__dirname, "heic.worker.cjs");
 
-type Pending = { resolve: (buffer: Buffer) => void; reject: (error: Error) => void };
-type PoolWorker = { worker: Worker; busy: boolean; current?: Pending };
+type Job = {
+  buffer: Buffer;
+  width: number;
+  heicQuality: number;
+  resolve: (buffer: Buffer) => void;
+  reject: (error: Error) => void;
+};
+type PoolWorker = { worker: Worker; busy: boolean; current?: Job };
 
 const workers: PoolWorker[] = [];
-const queue: Array<{ buffer: Buffer } & Pending> = [];
+const queue: Job[] = [];
 let nextJobId = 1;
 
 function spawnWorker(): PoolWorker {
@@ -46,7 +52,6 @@ function spawnWorker(): PoolWorker {
     dispatch();
   });
 
-  // Don't keep the process alive just because idle workers exist.
   pw.worker.unref();
   return pw;
 }
@@ -65,16 +70,30 @@ function dispatch(): void {
   const job = queue.shift();
   if (!job) return;
   free.busy = true;
-  free.current = { resolve: job.resolve, reject: job.reject };
+  free.current = job;
   free.worker.ref(); // active job must keep the process alive
   const jobId = nextJobId++;
-  free.worker.postMessage({ jobId, buffer: job.buffer });
+  free.worker.postMessage({
+    jobId,
+    buffer: job.buffer,
+    width: job.width,
+    heicQuality: job.heicQuality
+  });
+}
+
+function enqueue(buffer: Buffer, width: number, heicQuality: number): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    queue.push({ buffer, width, heicQuality, resolve, reject });
+    dispatch();
+  });
 }
 
 /** Decode + downscale a HEIC/HEIF buffer to a small JPEG preview off-thread. */
-export function decodeHeicPreview(buffer: Buffer): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
-    queue.push({ buffer, resolve, reject });
-    dispatch();
-  });
+export function decodeHeicPreview(buffer: Buffer, width: number): Promise<Buffer> {
+  return enqueue(buffer, width, 0.82);
+}
+
+/** Decode a HEIC/HEIF buffer to a full-size JPEG (used to convert on upload). */
+export function convertHeicToJpeg(buffer: Buffer): Promise<Buffer> {
+  return enqueue(buffer, 0, 0.9);
 }
