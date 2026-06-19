@@ -15,6 +15,20 @@ import {
   generateStorageKey,
   sanitizeFilename
 } from "../lib/file-utils";
+import {
+  getThumbnailBuffer,
+  isThumbnailableImage
+} from "../lib/thumbnail";
+import { buildArchivePath, streamZip } from "../lib/zip";
+
+const DEFAULT_PAGE_SIZE = 30;
+const MAX_PAGE_SIZE = 200;
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
 
 const folderCreateSchema = z.object({
   name: z.string().min(1).max(120),
@@ -122,7 +136,11 @@ function assertEditPermission(
 const publicRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/folders/:token/content", async (request, reply) => {
     const params = request.params as { token: string };
-    const query = request.query as { folderId?: string | null };
+    const query = request.query as {
+      folderId?: string | null;
+      limit?: string;
+      offset?: string;
+    };
     const shareContext = await resolvePublicFolderShare(params.token);
     if (!shareContext) {
       return reply.code(404).send({ message: "Public folder not found" });
@@ -133,7 +151,15 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.code(403).send({ message: "Folder access denied" });
     }
 
-    const [folders, files] = await Promise.all([
+    const limit = clampInt(query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
+    const offset = clampInt(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+
+    const fileWhere = {
+      ownerId: shareContext.rootFolder.ownerId,
+      folderId: currentFolderId
+    };
+
+    const [folders, files, total] = await Promise.all([
       prisma.folder.findMany({
         where: {
           ownerId: shareContext.rootFolder.ownerId,
@@ -142,15 +168,16 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
         orderBy: { name: "asc" }
       }),
       prisma.fileObject.findMany({
-        where: {
-          ownerId: shareContext.rootFolder.ownerId,
-          folderId: currentFolderId
-        },
-        orderBy: { createdAt: "desc" }
-      })
+        where: fileWhere,
+        orderBy: { createdAt: "desc" },
+        skip: offset,
+        take: limit
+      }),
+      prisma.fileObject.count({ where: fileWhere })
     ]);
 
     const baseUrl = inferBaseUrl(request);
+    const fileBase = `${baseUrl}/api/public/folders/${params.token}/files`;
 
     return {
       share: {
@@ -160,6 +187,9 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
         currentFolderId
       },
       folders,
+      total,
+      limit,
+      offset,
       files: files.map((file) => ({
         id: file.id,
         name: file.name,
@@ -168,7 +198,10 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
         folderId: file.folderId,
         createdAt: file.createdAt,
         updatedAt: file.updatedAt,
-        downloadUrl: `${baseUrl}/api/public/folders/${params.token}/files/${file.id}/download`
+        downloadUrl: `${fileBase}/${file.id}/download`,
+        thumbnailUrl: isThumbnailableImage(file.mimeType)
+          ? `${fileBase}/${file.id}/thumbnail`
+          : null
       }))
     };
   });
@@ -210,6 +243,148 @@ const publicRoutes: FastifyPluginAsync = async (fastify) => {
     );
 
     return reply.send(object.Body as unknown as NodeJS.ReadableStream);
+  });
+
+  // Lightweight cached thumbnail for grid previews in a public share.
+  fastify.get(
+    "/folders/:token/files/:fileId/thumbnail",
+    async (request, reply) => {
+      const params = request.params as { token: string; fileId: string };
+      const shareContext = await resolvePublicFolderShare(params.token);
+      if (!shareContext) {
+        return reply.code(404).send({ message: "Public folder not found" });
+      }
+
+      const file = await prisma.fileObject.findFirst({
+        where: {
+          id: params.fileId,
+          ownerId: shareContext.rootFolder.ownerId,
+          folderId: { in: shareContext.descendantIds }
+        }
+      });
+
+      if (!file) {
+        return reply.code(404).send({ message: "File not found in shared folder" });
+      }
+      if (!isThumbnailableImage(file.mimeType)) {
+        return reply.code(400).send({ message: "File is not a previewable image" });
+      }
+
+      try {
+        const buffer = await getThumbnailBuffer(file);
+        reply.header("Content-Type", "image/webp");
+        reply.header("Cache-Control", "public, max-age=86400");
+        return reply.send(buffer);
+      } catch (error) {
+        request.log.error({ err: error, fileId: file.id }, "public thumbnail failed");
+        return reply.code(500).send({ message: "Gagal membuat thumbnail" });
+      }
+    }
+  );
+
+  // Download an entire shared (sub)folder as a zip, preserving structure.
+  fastify.get("/folders/:token/download", async (request, reply) => {
+    const params = request.params as { token: string };
+    const query = request.query as { folderId?: string | null };
+    const shareContext = await resolvePublicFolderShare(params.token);
+    if (!shareContext) {
+      return reply.code(404).send({ message: "Public folder not found" });
+    }
+
+    const targetFolderId = query.folderId ?? shareContext.rootFolder.id;
+    if (!ensureFolderInShare(targetFolderId, shareContext)) {
+      return reply.code(403).send({ message: "Folder access denied" });
+    }
+
+    const allFolders = await prisma.folder.findMany({
+      where: { ownerId: shareContext.rootFolder.ownerId },
+      select: { id: true, name: true, parentId: true }
+    });
+    const folderMap = new Map(allFolders.map((f) => [f.id, f]));
+    const childrenMap = mapChildren(allFolders);
+
+    const descendantIds = collectDescendantIds(targetFolderId, childrenMap).filter(
+      (id) => shareContext.descendantSet.has(id)
+    );
+
+    const pathCache = new Map<string, string[]>();
+    const folderPathParts = (fid: string): string[] => {
+      const cached = pathCache.get(fid);
+      if (cached) return cached;
+      const parts: string[] = [];
+      let current: string | null = fid;
+      while (current) {
+        const node = folderMap.get(current);
+        if (!node) break;
+        parts.unshift(node.name);
+        if (current === targetFolderId) break;
+        current = node.parentId ?? null;
+      }
+      pathCache.set(fid, parts);
+      return parts;
+    };
+
+    const files = await prisma.fileObject.findMany({
+      where: {
+        ownerId: shareContext.rootFolder.ownerId,
+        folderId: { in: descendantIds }
+      },
+      select: { key: true, name: true, folderId: true }
+    });
+
+    if (files.length === 0) {
+      return reply
+        .code(400)
+        .send({ message: "Folder ini tidak punya file untuk diunduh" });
+    }
+
+    const folderName = folderMap.get(targetFolderId)?.name ?? "folder";
+    const entries = files.map((file) => ({
+      key: file.key,
+      name: buildArchivePath([
+        ...folderPathParts(file.folderId ?? targetFolderId),
+        file.name
+      ])
+    }));
+
+    return streamZip(reply, `${folderName}.zip`, entries);
+  });
+
+  // Batch download selected files inside a public share as a zip.
+  fastify.get("/folders/:token/download-zip", async (request, reply) => {
+    const params = request.params as { token: string };
+    const query = request.query as { ids?: string };
+    const shareContext = await resolvePublicFolderShare(params.token);
+    if (!shareContext) {
+      return reply.code(404).send({ message: "Public folder not found" });
+    }
+
+    const ids = (query.ids ?? "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (ids.length === 0) {
+      return reply.code(400).send({ message: "No file ids provided" });
+    }
+
+    const files = await prisma.fileObject.findMany({
+      where: {
+        id: { in: ids },
+        ownerId: shareContext.rootFolder.ownerId,
+        folderId: { in: shareContext.descendantIds }
+      },
+      select: { key: true, name: true }
+    });
+
+    if (files.length === 0) {
+      return reply.code(404).send({ message: "No files found" });
+    }
+
+    return streamZip(
+      reply,
+      `protekdrive-${files.length}-file.zip`,
+      files.map((file) => ({ key: file.key, name: file.name }))
+    );
   });
 
   fastify.post("/folders/:token/folders", async (request, reply) => {

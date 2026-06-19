@@ -24,6 +24,7 @@
     publicToken?: string | null;
     publicUrl?: string | null;
     downloadUrl?: string | null;
+    thumbnailUrl?: string | null;
     createdAt: string;
     updatedAt: string;
   };
@@ -42,6 +43,7 @@
     };
     folders: Folder[];
     files: FileItem[];
+    total?: number;
   };
   type StorageSummary = {
     totalBytes: number;
@@ -102,7 +104,14 @@
   let uploadFolderInput: HTMLInputElement | null = null;
   let viewMode: "list" | "grid" = "list";
   let thumbnailCache = new Map<string, string>();
-  let loadingThumbnails = false;
+  const thumbnailLoading = new Set<string>();
+
+  // ── Pagination (infinite scroll, +30 each time) ───────────────────────────
+  const PAGE_SIZE = 30;
+  let fileTotal = 0;
+  let loadingMoreFiles = false;
+  let scrollContainer: HTMLElement | null = null;
+  $: hasMoreFiles = files.length < fileTotal;
 
   // Profile modal
   let showProfile = false;
@@ -126,10 +135,9 @@
   $: selectedCount = selectedIds.size;
   $: selectedFileCount = filteredRows.filter((row) => selectedIds.has(rowId(row)) && row.kind === "file").length;
 
-  $: driveRows = [...folders.map(folderToRow), ...files.map(fileToRow)].sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
+  // Folders come pre-sorted (name asc) and files in server order (newest first).
+  // Keep server order so infinite-scroll pages append consistently.
+  $: driveRows = [...folders.map(folderToRow), ...files.map(fileToRow)];
   $: filteredRows = driveRows.filter((row) =>
     row.name.toLowerCase().includes(searchQuery.toLowerCase().trim())
   );
@@ -179,6 +187,7 @@
   }
 
   function handleRowClick(event: MouseEvent, row: DriveRow, index: number) {
+    // Ctrl/Cmd+click → toggle this item in the selection (works for folders too).
     if (event.ctrlKey || event.metaKey) {
       const id = rowId(row);
       const next = new Set(selectedIds);
@@ -187,15 +196,25 @@
       selectedIds = next;
       lastClickedIndex = index;
       selectedRow = row;
-    } else if (event.shiftKey && lastClickedIndex >= 0) {
+      return;
+    }
+    // Shift+click → range select from the last clicked row.
+    if (event.shiftKey && lastClickedIndex >= 0) {
       const start = Math.min(lastClickedIndex, index);
       const end = Math.max(lastClickedIndex, index);
       selectedIds = new Set(filteredRows.slice(start, end + 1).map(rowId));
-    } else {
-      selectedIds = new Set([rowId(row)]);
-      lastClickedIndex = index;
-      selectedRow = row;
+      return;
     }
+    // Plain click on a folder opens it (it does NOT mark/select the folder).
+    // To select a folder use its checkbox or Ctrl/Cmd+click.
+    if (row.kind === "folder") {
+      openFolder(row.folder);
+      return;
+    }
+    // Plain click on a file selects just that file.
+    selectedIds = new Set([rowId(row)]);
+    lastClickedIndex = index;
+    selectedRow = row;
   }
 
   function toggleCheckbox(row: DriveRow, index: number) {
@@ -546,34 +565,85 @@
     resetMessages();
     try {
       if (publicMode && publicShareToken) {
-        const query = currentFolderId ? `?folderId=${encodeURIComponent(currentFolderId)}` : "";
+        const folderParam = currentFolderId
+          ? `folderId=${encodeURIComponent(currentFolderId)}&`
+          : "";
         const response = await request<PublicFolderContentResponse>(
-          `/api/public/folders/${publicShareToken}/content${query}`
+          `/api/public/folders/${publicShareToken}/content?${folderParam}limit=${PAGE_SIZE}&offset=0`
         );
         publicSharePermission = response.share.permission;
         publicRootFolderId = response.share.rootFolderId;
         currentFolderId = response.share.currentFolderId;
         folders = response.folders;
         files = response.files.map((file) => ({ ...file, isPublic: false, publicUrl: null }));
+        fileTotal = response.total ?? response.files.length;
         storageSummary = null;
         return;
       }
       if (!user) return;
       const parentQuery = currentFolderId ? `?parentId=${encodeURIComponent(currentFolderId)}` : "?parentId=";
-      const fileQuery = currentFolderId ? `?folderId=${encodeURIComponent(currentFolderId)}` : "?folderId=";
+      const fileFolderParam = currentFolderId
+        ? `folderId=${encodeURIComponent(currentFolderId)}&`
+        : "folderId=&";
       const summaryPromise = request<StorageSummary>("/api/files/storage/summary").catch(() => null);
       const [folderResponse, fileResponse] = await Promise.all([
         request<{ folders: Folder[] }>(`/api/folders${parentQuery}`),
-        request<{ files: FileItem[] }>(`/api/files${fileQuery}`)
+        request<{ files: FileItem[]; total: number }>(
+          `/api/files?${fileFolderParam}limit=${PAGE_SIZE}&offset=0`
+        )
       ]);
       const summaryResponse = await summaryPromise;
       folders = folderResponse.folders;
       files = fileResponse.files;
+      fileTotal = fileResponse.total ?? fileResponse.files.length;
       storageSummary = summaryResponse;
     } catch (error) {
       setError(error instanceof Error ? error.message : "Gagal load data drive");
     } finally {
       loadingDrive = false;
+    }
+  }
+
+  async function loadMoreFiles() {
+    if (loadingMoreFiles || loadingDrive) return;
+    if (files.length >= fileTotal) return;
+    loadingMoreFiles = true;
+    try {
+      const offset = files.length;
+      if (publicMode && publicShareToken) {
+        const folderParam = currentFolderId
+          ? `folderId=${encodeURIComponent(currentFolderId)}&`
+          : "";
+        const response = await request<PublicFolderContentResponse>(
+          `/api/public/folders/${publicShareToken}/content?${folderParam}limit=${PAGE_SIZE}&offset=${offset}`
+        );
+        files = [
+          ...files,
+          ...response.files.map((file) => ({ ...file, isPublic: false, publicUrl: null }))
+        ];
+        fileTotal = response.total ?? fileTotal;
+      } else {
+        const folderParam = currentFolderId
+          ? `folderId=${encodeURIComponent(currentFolderId)}&`
+          : "folderId=&";
+        const response = await request<{ files: FileItem[]; total: number }>(
+          `/api/files?${folderParam}limit=${PAGE_SIZE}&offset=${offset}`
+        );
+        files = [...files, ...response.files];
+        fileTotal = response.total ?? fileTotal;
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Gagal memuat file berikutnya");
+    } finally {
+      loadingMoreFiles = false;
+    }
+  }
+
+  function handlelistScroll(event: Event) {
+    const el = event.currentTarget as HTMLElement;
+    // Trigger the next page a bit before hitting the very bottom.
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 400) {
+      void loadMoreFiles();
     }
   }
 
@@ -763,6 +833,9 @@
   }
 
   function openFolder(folder: Folder) {
+    // Guard against the second click of a double-click (and stray re-entry)
+    // pushing a duplicate breadcrumb before the view re-renders.
+    if (currentFolderId === folder.id) return;
     breadcrumbs = [...breadcrumbs, { id: folder.id, name: folder.name }];
     currentFolderId = folder.id;
     selectedRow = null;
@@ -933,53 +1006,109 @@
     }
   }
 
+  // Trigger a browser download via a temporary <a>. The backend sets
+  // Content-Disposition so the right filename is used even cross-origin.
+  function triggerDownload(url: string, filename?: string) {
+    const a = document.createElement("a");
+    a.href = url;
+    if (filename) a.download = filename;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function folderDownloadUrl(folder: Folder): string {
+    if (publicMode && publicShareToken) {
+      return `${API_BASE}/api/public/folders/${publicShareToken}/download?folderId=${encodeURIComponent(folder.id)}`;
+    }
+    return `${API_BASE}/api/folders/${folder.id}/download`;
+  }
+
+  // Download an entire folder (incl. nested folders) as a zip archive.
+  function downloadFolder(folder: Folder) {
+    try {
+      triggerDownload(folderDownloadUrl(folder), `${folder.name}.zip`);
+      setSuccess(`Menyiapkan ZIP untuk folder "${folder.name}"...`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download folder gagal");
+    }
+  }
+
+  // Download all selected files. A single file downloads directly; multiple
+  // files are bundled into one zip on the server.
   async function downloadSelected() {
     const fileRows = filteredRows.filter(
       (row) => selectedIds.has(rowId(row)) && row.kind === "file"
-    ) as Array<{ kind: "file"; file: FileItem; id: string; name: string; modifiedAt: string; sizeLabel: string }>;
+    ) as Array<{ kind: "file"; file: FileItem }>;
     if (!fileRows.length) {
-      setError("Tidak ada file yang dipilih (folder tidak dapat didownload).");
+      setError("Tidak ada file yang dipilih (centang file, bukan folder).");
       return;
     }
-    for (const row of fileRows) {
-      await downloadFile(row.file);
-      await new Promise((r) => setTimeout(r, 300));
+    if (fileRows.length === 1) {
+      await downloadFile(fileRows[0].file);
+      setSuccess("File berhasil didownload.");
+      return;
     }
-    setSuccess(`${fileRows.length} file berhasil didownload.`);
+    const ids = encodeURIComponent(fileRows.map((row) => row.file.id).join(","));
+    const url =
+      publicMode && publicShareToken
+        ? `${API_BASE}/api/public/folders/${publicShareToken}/download-zip?ids=${ids}`
+        : `${API_BASE}/api/files/download-zip?ids=${ids}`;
+    triggerDownload(url, `protekdrive-${fileRows.length}-file.zip`);
+    setSuccess(`Menyiapkan ZIP berisi ${fileRows.length} file...`);
   }
 
-  async function loadGridThumbnails() {
-    if (viewMode !== "grid" || loadingThumbnails) return;
-    loadingThumbnails = true;
+  // ── Lazy thumbnails ────────────────────────────────────────────────────────
+  // Fetch a small, server-optimised webp thumbnail (never the full-res image),
+  // only when the card scrolls near the viewport.
+  async function requestThumbnail(file: FileItem) {
+    if (thumbnailCache.has(file.id) || thumbnailLoading.has(file.id)) return;
+    if (!file.mimeType?.startsWith("image/")) return;
+    thumbnailLoading.add(file.id);
     try {
-      const imageFiles = filteredRows
-        .filter((r) => r.kind === "file" && (r as { kind: "file"; file: FileItem }).file.mimeType?.startsWith("image/"))
-        .map((r) => (r as { kind: "file"; file: FileItem }).file)
-        .filter((f) => !thumbnailCache.has(f.id))
-        .slice(0, 20);
-
-      for (const file of imageFiles) {
-        try {
-          let url: string;
-          if (publicMode && publicShareToken) {
-            url = file.downloadUrl ?? `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/download`;
-          } else if (file.isPublic && file.publicUrl) {
-            url = file.publicUrl;
-          } else {
-            const resp = await request<{ url: string }>(`/api/files/${file.id}/download-url`);
-            url = resp.url;
-          }
-          thumbnailCache.set(file.id, url);
-          thumbnailCache = thumbnailCache;
-        } catch { /* skip failed thumbnails */ }
+      let url: string;
+      if (publicMode && publicShareToken) {
+        url =
+          file.thumbnailUrl ??
+          `${API_BASE}/api/public/folders/${publicShareToken}/files/${file.id}/thumbnail`;
+      } else {
+        const resp = await request<{ url: string }>(`/api/files/${file.id}/thumbnail-url`);
+        url = resp.url;
       }
+      thumbnailCache.set(file.id, url);
+      thumbnailCache = thumbnailCache; // trigger reactivity
+    } catch {
+      /* leave the fallback icon in place */
     } finally {
-      loadingThumbnails = false;
+      thumbnailLoading.delete(file.id);
     }
   }
 
-  $: if (viewMode === "grid" && filteredRows.length > 0) {
-    void loadGridThumbnails();
+  // Svelte action: lazy-load a thumbnail when the element nears the viewport.
+  function lazyThumb(node: HTMLElement, file: FileItem) {
+    let observer: IntersectionObserver | null = null;
+    if (file.mimeType?.startsWith("image/")) {
+      observer = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              void requestThumbnail(file);
+              observer?.disconnect();
+              observer = null;
+              break;
+            }
+          }
+        },
+        { rootMargin: "300px" }
+      );
+      observer.observe(node);
+    }
+    return {
+      destroy() {
+        observer?.disconnect();
+      }
+    };
   }
 
   function formatSize(bytes: number): string {
@@ -1150,7 +1279,7 @@
                 <button
                   class="border-l border-[#dadce0] px-2.5 py-1.5 transition-colors {viewMode === 'grid' ? 'bg-[#e8f0fe] text-[#1967d2]' : 'text-[#5f6368] hover:bg-[#f1f3f4]'}"
                   title="Tampilan grid"
-                  on:click={() => { viewMode = 'grid'; void loadGridThumbnails(); }}
+                  on:click={() => (viewMode = 'grid')}
                 >
                   <Icon name="grid" size={14} />
                 </button>
@@ -1244,7 +1373,13 @@
           {/if}
 
           <!-- File display: List or Grid -->
-          <div class="mt-2 flex-1 overflow-auto pb-14 md:pb-0" role="presentation" on:contextmenu={openBackgroundMenu}>
+          <div
+            class="mt-2 flex-1 overflow-auto pb-14 md:pb-0"
+            role="presentation"
+            bind:this={scrollContainer}
+            on:scroll={handlelistScroll}
+            on:contextmenu={openBackgroundMenu}
+          >
             {#if viewMode === "list"}
               <!-- List view -->
               <table class="w-full min-w-215 text-sm">
@@ -1271,7 +1406,7 @@
                   {:else if filteredRows.length === 0}
                     <tr><td class="px-4 py-6 text-[#5f6368]" colspan="6">Tidak ada data.</td></tr>
                   {:else}
-                    {#each filteredRows as row, index}
+                    {#each filteredRows as row, index (rowId(row))}
                       <tr
                         data-row="1"
                         class={`group cursor-default border-b border-[#f1f3f4] hover:bg-[#f8f9fa] ${isRowSelected(row) ? "bg-[#e8f0fe] hover:bg-[#dce8fd]" : ""}`}
@@ -1313,10 +1448,27 @@
                             >
                               <Icon name="download" size={14} />
                             </button>
+                          {:else}
+                            <button
+                              class="rounded-full p-1.5 text-[#5f6368] opacity-0 transition-all hover:bg-[#e8f0fe] hover:text-[#1a73e8] group-hover:opacity-100"
+                              title="Download folder (ZIP) {row.name}"
+                              on:click|stopPropagation={() => downloadFolder(row.folder)}
+                            >
+                              <Icon name="download" size={14} />
+                            </button>
                           {/if}
                         </td>
                       </tr>
                     {/each}
+                    {#if loadingMoreFiles}
+                      <tr><td class="px-4 py-4 text-center text-xs text-[#5f6368]" colspan="6">Memuat file berikutnya...</td></tr>
+                    {:else if hasMoreFiles}
+                      <tr><td class="px-4 py-3 text-center" colspan="6">
+                        <button class="rounded-full border border-[#dadce0] px-4 py-1.5 text-xs text-[#1a73e8] hover:bg-[#f1f3f4]" on:click={loadMoreFiles}>
+                          Muat 30 lagi ({files.length}/{fileTotal})
+                        </button>
+                      </td></tr>
+                    {/if}
                   {/if}
                 </tbody>
               </table>
@@ -1328,7 +1480,7 @@
                 <div class="px-4 py-8 text-sm text-[#5f6368]">Tidak ada data.</div>
               {:else}
                 <div class="p-4 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                  {#each filteredRows as row, index}
+                  {#each filteredRows as row, index (rowId(row))}
                     <div
                       data-row="1"
                       role="button"
@@ -1353,13 +1505,22 @@
                       <div class="flex h-32 items-center justify-center overflow-hidden {row.kind === 'folder' ? 'bg-[#fffde7]' : getFileBgClass(row.kind === 'file' ? row.file.mimeType : null)}">
                         {#if row.kind === "folder"}
                           <span class="text-[#f9ab00]"><Icon name="folder" size={52} /></span>
-                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/") && thumbnailCache.has(row.file.id)}
-                          <img
-                            src={thumbnailCache.get(row.file.id)}
-                            alt={row.name}
-                            class="h-full w-full object-cover"
-                            loading="lazy"
-                          />
+                        {:else if row.kind === "file" && row.file.mimeType?.startsWith("image/")}
+                          <div class="h-full w-full" use:lazyThumb={row.file}>
+                            {#if thumbnailCache.has(row.file.id)}
+                              <img
+                                src={thumbnailCache.get(row.file.id)}
+                                alt={row.name}
+                                class="h-full w-full object-cover"
+                                loading="lazy"
+                                decoding="async"
+                              />
+                            {:else}
+                              <div class="flex h-full w-full animate-pulse items-center justify-center bg-[#eef1f5]">
+                                <span class="text-[#bdc1c6]"><Icon name="file" size={36} /></span>
+                              </div>
+                            {/if}
+                          </div>
                         {:else}
                           <span class={getFileColorClass(row.kind === "file" ? row.file.mimeType : null)}>
                             <Icon name="file" size={42} />
@@ -1386,12 +1547,29 @@
                             >
                               <Icon name="download" size={12} />
                             </button>
+                          {:else}
+                            <button
+                              class="rounded-full p-1 text-[#1a73e8] opacity-0 transition-all hover:bg-[#d2e3fc] group-hover:opacity-100"
+                              title="Download folder (ZIP) {row.name}"
+                              on:click|stopPropagation={() => downloadFolder(row.folder)}
+                            >
+                              <Icon name="download" size={12} />
+                            </button>
                           {/if}
                         </div>
                       </div>
                     </div>
                   {/each}
                 </div>
+                {#if loadingMoreFiles}
+                  <div class="px-4 pb-6 text-center text-xs text-[#5f6368]">Memuat file berikutnya...</div>
+                {:else if hasMoreFiles}
+                  <div class="px-4 pb-6 text-center">
+                    <button class="rounded-full border border-[#dadce0] px-4 py-1.5 text-xs text-[#1a73e8] hover:bg-[#f1f3f4]" on:click={loadMoreFiles}>
+                      Muat 30 lagi ({files.length}/{fileTotal})
+                    </button>
+                  </div>
+                {/if}
               {/if}
             {/if}
           </div>
@@ -1489,6 +1667,9 @@
         {:else if folderMenuTarget}
           <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[#f1f3f4]" on:click={() => runMenuAction(() => openFolder(folderMenuTarget))}>
             <Icon name="open" size={14} /> Open
+          </button>
+          <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[#f1f3f4]" on:click={() => runMenuAction(() => downloadFolder(folderMenuTarget))}>
+            <Icon name="download" size={14} /> Download (ZIP)
           </button>
           {#if !publicMode}
             <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[#f1f3f4]" on:click={() => runMenuAction(() => renameFolder(folderMenuTarget))}>

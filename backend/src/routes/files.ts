@@ -12,6 +12,21 @@ import {
   sanitizeFilename,
   toFileResponse
 } from "../lib/file-utils";
+import {
+  deleteThumbnailsQuietly,
+  isThumbnailableImage,
+  thumbnailSignedUrl
+} from "../lib/thumbnail";
+import { streamZip } from "../lib/zip";
+
+const DEFAULT_PAGE_SIZE = 30;
+const MAX_PAGE_SIZE = 200;
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
 
 const moveFileSchema = z.object({
   targetFolderId: z.string().nullable().optional()
@@ -64,19 +79,35 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
     "/",
     { preHandler: [fastify.authenticate] },
     async (request) => {
-      const query = request.query as { folderId?: string | null };
+      const query = request.query as {
+        folderId?: string | null;
+        limit?: string;
+        offset?: string;
+      };
       const folderId = query.folderId === "" ? null : (query.folderId ?? null);
+      const limit = clampInt(query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
+      const offset = clampInt(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
-      const files = await prisma.fileObject.findMany({
-        where: {
-          ownerId: request.user.userId,
-          folderId
-        },
-        orderBy: { createdAt: "desc" }
-      });
+      const where = {
+        ownerId: request.user.userId,
+        folderId
+      };
+
+      const [files, total] = await Promise.all([
+        prisma.fileObject.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          skip: offset,
+          take: limit
+        }),
+        prisma.fileObject.count({ where })
+      ]);
 
       return {
-        files: files.map((file) => toFileResponse(file, request))
+        files: files.map((file) => toFileResponse(file, request)),
+        total,
+        limit,
+        offset
       };
     }
   );
@@ -99,6 +130,65 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
         totalGb: Number((totalBytes / (1024 ** 3)).toFixed(3)),
         fileCount: aggregated._count._all
       };
+    }
+  );
+
+  // Lightweight, cached webp thumbnail for grid previews (never full-res).
+  fastify.get(
+    "/:id/thumbnail-url",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const params = request.params as { id: string };
+      const file = await prisma.fileObject.findFirst({
+        where: { id: params.id, ownerId: request.user.userId }
+      });
+
+      if (!file) {
+        return reply.code(404).send({ message: "File not found" });
+      }
+      if (!isThumbnailableImage(file.mimeType)) {
+        return reply.code(400).send({ message: "File is not a previewable image" });
+      }
+
+      try {
+        const url = await thumbnailSignedUrl(file);
+        return { url, expiresInSeconds: 900 };
+      } catch (error) {
+        request.log.error({ err: error, fileId: file.id }, "thumbnail failed");
+        return reply.code(500).send({ message: "Gagal membuat thumbnail" });
+      }
+    }
+  );
+
+  // Batch download: zip up the selected files (used by multi-select).
+  fastify.get(
+    "/download-zip",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const query = request.query as { ids?: string };
+      const ids = (query.ids ?? "")
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean);
+
+      if (ids.length === 0) {
+        return reply.code(400).send({ message: "No file ids provided" });
+      }
+
+      const files = await prisma.fileObject.findMany({
+        where: { id: { in: ids }, ownerId: request.user.userId },
+        select: { key: true, name: true }
+      });
+
+      if (files.length === 0) {
+        return reply.code(404).send({ message: "No files found" });
+      }
+
+      return streamZip(
+        reply,
+        `protekdrive-${files.length}-file.zip`,
+        files.map((file) => ({ key: file.key, name: file.name }))
+      );
     }
   );
 
@@ -422,6 +512,7 @@ const fileRoutes: FastifyPluginAsync = async (fastify) => {
 
       await deleteObject(file.key);
       await prisma.fileObject.delete({ where: { id: file.id } });
+      await deleteThumbnailsQuietly([file.id]);
 
       return { message: "File deleted" };
     }

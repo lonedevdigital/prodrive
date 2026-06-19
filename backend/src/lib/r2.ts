@@ -2,6 +2,7 @@ import {
   CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -108,4 +109,37 @@ export async function getObject(key: string) {
       Key: key
     })
   );
+}
+
+/**
+ * Returns true if an object exists under `key`, false on 404.
+ * Re-throws unexpected errors.
+ */
+export async function headObject(key: string): Promise<boolean> {
+  try {
+    await r2Client.send(
+      new HeadObjectCommand({
+        Bucket: appConfig.r2.bucket,
+        Key: key
+      })
+    );
+    return true;
+  } catch (error) {
+    const status = (error as { $metadata?: { httpStatusCode?: number } })
+      ?.$metadata?.httpStatusCode;
+    const name = (error as { name?: string })?.name;
+    if (status === 404 || name === "NotFound" || name === "NoSuchKey") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/** Best-effort delete that never throws (for cleanup of derived objects). */
+export async function deleteObjectQuietly(key: string): Promise<void> {
+  try {
+    await deleteObject(key);
+  } catch {
+    /* ignore */
+  }
 }
